@@ -28,6 +28,7 @@ your computer's memory.
    period ('week', 'month', or 'year') that will fit into your systems memory
    given the number of locations being fetched.
 """
+import typing
 import pandas as pd
 import xarray as xr
 import fsspec
@@ -70,6 +71,33 @@ NWM30_MIN_DATE = pd.Timestamp(1979, 2, 1, 1)
 NWM30_MAX_DATE = pd.Timestamp(2023, 1, 31, 23)
 
 logger = logging.getLogger(__name__)
+__VERBOSE: bool = False
+
+def set_verbose(verbose: bool = True):
+    """
+    Sets the verbosity flag for logging
+
+    Parameters
+    ----------
+        verbose: Whether to log in verbose mode
+    """
+    global __VERBOSE
+    __VERBOSE = verbose
+
+
+def emit_verbose_message(message: str, *args, level: int = logging.INFO, **kwargs):
+    """
+    Write messages to the log if currently in verbose mode
+
+    Parameters
+    ----------
+        message: The basic message to write
+        args: Positional arguments that would generally go into `logging.log`
+        level: The log level to write to
+        kwargs: Keyword arguments you would generally send to `logging.log`
+    """
+    if __VERBOSE:
+        logger.log(level, message, *args, **kwargs)
 
 
 def validate_start_end_date(
@@ -119,11 +147,13 @@ def validate_start_end_date(
 def da_to_df(
         nwm_version: SupportedNWMRetroVersionsEnum,
         da: xr.DataArray,
-        variable_mapper: Dict[str, Dict[str, str]]
+        variable_mapper: Dict[str, Dict[str, str]],
+        enforce_data_types: bool = True
 ) -> pd.DataFrame:
     """Format NWM retrospective data to TEEHR format."""
     logger.debug("Converting DataArray to a formatted DataFrame.")
     df = da.to_dataframe()
+    emit_verbose_message("Zarr data converted to dataframe")
     df.reset_index(inplace=True)
 
     if not variable_mapper:
@@ -145,14 +175,19 @@ def da_to_df(
         },
         inplace=True,
     )
+    emit_verbose_message(f"Renamed 'time', 'feature_id', and {da.name}")
     df.drop(columns=["latitude", "longitude"], inplace=True)
+    emit_verbose_message("Dropped coordinates")
 
     df[LOCATION_ID] = f"{nwm_version}-" + df[LOCATION_ID].astype(str)
 
     if (nwm_version == "nwm21") or (nwm_version == "nwm30"):
         df.drop(columns=["elevation", "gage_id", "order"], inplace=True)
 
-    df = format_timeseries_data_types(df)
+    if enforce_data_types:
+        df = format_timeseries_data_types(df)
+    else:
+        emit_verbose_message("Bypassing data type enforcement")
 
     return df
 
@@ -194,6 +229,7 @@ def nwm_retro_to_parquet(
     overwrite_output: Optional[bool] = False,
     domain: Optional[SupportedNWMRetroDomainsEnum] = "CONUS",
     variable_mapper: Dict[str, Dict[str, str]] = None,
+    enforce_data_types: bool = True,
 ):
     """Fetch NWM retrospective at NWM COMIDs and store as Parquet file.
 
@@ -231,6 +267,7 @@ def nwm_retro_to_parquet(
     variable_mapper : Dict[str, Dict[str, str]]
         Dictionary mapping NWM variable and unit names to TEEHR variable
         and unit names.
+    enforce_data_types: Ensure that all data types come in and are formatted as expected
 
 
     Examples
@@ -281,6 +318,7 @@ def nwm_retro_to_parquet(
     start_date = pd.Timestamp(start_date)
     end_date = pd.Timestamp(end_date)
 
+    emit_verbose_message("Validating Times")
     validate_start_end_date(nwm_version, start_date, end_date)
 
     # Include the entirety of the specified end day
@@ -290,12 +328,14 @@ def nwm_retro_to_parquet(
     if not output_dir.exists():
         output_dir.mkdir(parents=True)
 
+    emit_verbose_message(f"Connecting to zarr at {s3_zarr_url}")
     da = xr.open_zarr(
         fsspec.get_mapper(s3_zarr_url, anon=True), consolidated=True
     )[variable_name].sel(
         feature_id=location_ids, time=slice(start_date, end_date)
     )
 
+    emit_verbose_message("zarr data selected")
     # Chunk data by time
     logger.debug("Chunking data by time.")
     periods = create_periods_based_on_chunksize(
@@ -305,7 +345,7 @@ def nwm_retro_to_parquet(
     )
 
     for period in periods:
-
+        emit_verbose_message(f"Retrieving data based on {period}")
         if period is not None:
             dts = get_period_start_end_times(
                 period=period,
@@ -316,14 +356,21 @@ def nwm_retro_to_parquet(
             dts = {"start_dt": start_date, "end_dt": end_date}
 
         da_i = da.sel(time=slice(dts["start_dt"], dts["end_dt"]))
+        emit_verbose_message("Chunked data selected")
+        output_filename = format_grouped_filename(da_i)
+        output_filepath = Path(
+            output_parquet_dir, output_filename
+        )
+
+        if output_filepath.exists() and not overwrite_output:
+            emit_verbose_message(f"{output_filename} already exists - skipping")
+            continue
 
         logger.debug(
             f"Fetching point data for {dts['start_dt']} to {dts['end_dt']}."
         )
 
-        df = da_to_df(nwm_version, da_i, variable_mapper)
-        output_filename = format_grouped_filename(da_i)
-        output_filepath = Path(
-            output_parquet_dir, output_filename
-        )
+        df = da_to_df(nwm_version, da_i, variable_mapper, enforce_data_types=enforce_data_types)
+        emit_verbose_message("Retrospective data loaded. Now writing...")
         write_parquet_file(output_filepath, overwrite_output, df)
+        emit_verbose_message(f"Retrospective data for {period} written to disk")
